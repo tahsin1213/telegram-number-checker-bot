@@ -8,8 +8,8 @@ from datetime import datetime
 from telethon import TelegramClient, errors
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-import json
 import sys
+import traceback
 
 # ============================================
 # YOUR CREDENTIALS - KEEP PRIVATE!
@@ -28,41 +28,61 @@ ADMIN_IDS = [8409706278]  # <-- YOUR TELEGRAM ID HERE
 # ============================================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
+    level=logging.DEBUG,
     handlers=[
-        logging.FileHandler('/tmp/bot.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
 # ============================================
-# TELEGRAM CLIENT - FIXED FOR RAILWAY
+# FIX FOR RAILWAY ASYNCIO
+# ============================================
+try:
+    import uvloop
+    uvloop.install()
+except:
+    pass
+
+# ============================================
+# TELEGRAM CLIENT - SIMPLIFIED
 # ============================================
 telegram_client = None
+client_lock = asyncio.Lock()
 
 async def get_telegram_client():
-    """Initialize and return Telegram client - Railway compatible"""
+    """Initialize and return Telegram client"""
     global telegram_client
-    try:
-        if telegram_client is None:
+    
+    async with client_lock:
+        if telegram_client is not None:
+            try:
+                # Check if client is still connected
+                await telegram_client.get_me()
+                return telegram_client
+            except:
+                logger.info("Client disconnected, creating new one...")
+                telegram_client = None
+        
+        try:
             logger.info("Creating new Telegram client...")
-            # Use /tmp directory for session files (writable in Railway)
             session_file = '/tmp/admin_session'
-            telegram_client = TelegramClient(session_file, API_ID, API_HASH)
+            client = TelegramClient(session_file, API_ID, API_HASH)
             
-            # Start client
-            await telegram_client.start()
-            logger.info("Telegram client started successfully")
+            logger.info("Starting client...")
+            await client.start()
             
-            # Test client
-            me = await telegram_client.get_me()
-            logger.info(f"Logged in as: {me.first_name}")
+            # Test connection
+            me = await client.get_me()
+            logger.info(f"Connected as: {me.first_name} (ID: {me.id})")
             
-        return telegram_client
-    except Exception as e:
-        logger.error(f"Failed to start Telegram client: {e}")
-        raise e
+            telegram_client = client
+            return telegram_client
+            
+        except Exception as e:
+            logger.error(f"Failed to create Telegram client: {e}")
+            logger.error(traceback.format_exc())
+            raise
 
 async def check_phone_number(phone):
     """Check if phone number exists on Telegram"""
@@ -76,7 +96,7 @@ async def check_phone_number(phone):
         elif not phone.startswith('+'):
             phone = '+' + phone
             
-        logger.info(f"Checking phone: {original_phone} -> {phone}")
+        logger.debug(f"Checking phone: {original_phone} -> {phone}")
         
         try:
             entity = await client.get_entity(phone)
@@ -99,14 +119,21 @@ async def check_phone_number(phone):
             logger.info(f"Not found: {phone}")
             return {"found": False, "phone": phone, "error": "Not found on Telegram"}
         except errors.FloodWaitError as e:
-            logger.warning(f"Flood wait: {e.seconds}s for {phone}")
+            logger.warning(f"Flood wait: {e.seconds}s")
             return {"found": False, "phone": phone, "error": f"Flood wait {e.seconds}s"}
+        except errors.rpcerrorlist.ApiIdInvalidError:
+            logger.error("Invalid API ID")
+            return {"found": False, "phone": phone, "error": "Invalid API ID"}
+        except errors.rpcerrorlist.AccessTokenInvalidError:
+            logger.error("Invalid access token")
+            return {"found": False, "phone": phone, "error": "Invalid API credentials"}
         except Exception as e:
             logger.error(f"Error checking {phone}: {e}")
             return {"found": False, "phone": phone, "error": str(e)}
             
     except Exception as e:
         logger.error(f"Fatal error in check_phone_number: {e}")
+        logger.error(traceback.format_exc())
         return {"found": False, "phone": phone, "error": "Server error"}
 
 def is_admin(user_id):
@@ -266,12 +293,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(f, filename=os.path.basename(filename))
         
         # Cleanup
-        os.remove(file_path)
-        os.remove(filename)
+        try:
+            os.remove(file_path)
+            os.remove(filename)
+        except:
+            pass
         context.user_data['awaiting_file'] = False
         
     except Exception as e:
         logger.error(f"Error in handle_document: {e}")
+        logger.error(traceback.format_exc())
         await update.message.reply_text(f"❌ Error: {str(e)}")
         context.user_data['awaiting_file'] = False
 
@@ -361,21 +392,30 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the bot"""
-    logger.info("="*50)
-    logger.info("Starting Telegram Number Checker Bot")
-    logger.info("="*50)
+    print("="*50)
+    print("Starting Telegram Number Checker Bot")
+    print("="*50)
     
     # Check credentials
-    if not BOT_TOKEN or not API_ID or not API_HASH:
-        logger.error("Missing credentials!")
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN is missing!")
         return
     
-    logger.info(f"Bot Token: {BOT_TOKEN[:10]}...")
-    logger.info(f"API ID: {API_ID}")
-    logger.info(f"Admin IDs: {ADMIN_IDS}")
+    if not API_ID:
+        print("❌ API_ID is missing!")
+        return
+    
+    if not API_HASH:
+        print("❌ API_HASH is missing!")
+        return
+    
+    print(f"✓ Bot Token: {BOT_TOKEN[:10]}...")
+    print(f"✓ API ID: {API_ID}")
+    print(f"✓ Admin IDs: {ADMIN_IDS}")
     
     try:
         # Create application
+        print("Creating bot application...")
         app = Application.builder().token(BOT_TOKEN).build()
         
         # Add handlers
@@ -390,14 +430,14 @@ def main():
         # Add error handler
         app.add_error_handler(error_handler)
         
-        logger.info("Bot is running...")
+        print("✓ Bot is running... Press Ctrl+C to stop")
         
         # Start bot
         app.run_polling()
         
     except Exception as e:
-        logger.error(f"Fatal error in main: {e}")
-        raise e
+        print(f"❌ Fatal error: {e}")
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
